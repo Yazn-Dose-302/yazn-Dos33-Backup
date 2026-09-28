@@ -1,60 +1,49 @@
 """
-.yazn-Dos33 Backup v2.2
-Clean multi-source Windows backup utility.
+.yazn-Dos33 Backup - Clean Multi Source
 
-Changes in v2.2:
-- Clear source manager instead of sequential/confusing pickers.
-- Add multiple files and multiple folders in one job.
-- Background scan/copy with a small progress window.
-- Arabic UI text is reshaped for Tkinter where needed.
-- Custom result dialog avoids mixed RTL/LTR messagebox problems.
-- Duplicate hashes are registered only AFTER a successful copy.
-- Reparse points/symlinks are skipped to avoid loops/unexpected targets.
-- No CMD when built with the supplied --windowed build script.
+Simplified backup workflow:
+- No CMD/console window is used by the final EXE build.
+- No unused console banner, color theme, or drive-selection code.
+- Supports selecting multiple files at once.
+- Supports adding multiple source folders.
+- Uses one destination folder for the whole backup.
+- Scans and copies silently.
+- Skips exact duplicate files using SHA-256 hashes.
+- Writes a local backup_log.txt file inside the backup folder.
+- Shows one completion message at the end.
 """
 
 import os
 import re
-import stat
 import shutil
 import hashlib
-import threading
-import queue
 from collections import Counter, defaultdict
 from datetime import datetime
-
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-
-try:
-    import arabic_reshaper
-    from bidi.algorithm import get_display
-except ImportError:
-    arabic_reshaper = None
-    get_display = None
+from tkinter import filedialog, messagebox
 
 
 APP_NAME = ".yazn-Dos33 Backup"
-VERSION = "2.2"
+VERSION = "2.1"
 HASH_CHUNK_SIZE = 4 * 1024 * 1024
 
 
 # ============================================================================
-# Arabic / text helpers
+# General helper functions
 # ============================================================================
 
-def ar(text):
-    """Prepare Arabic text for Tk widgets that render primarily LTR."""
-    if not text:
-        return text
+def normalize(path):
+    return os.path.normcase(os.path.abspath(path))
 
-    if arabic_reshaper is None or get_display is None:
-        return text
 
+def is_inside(child, parent):
+    """Return True if child is the same path as parent or is located inside it."""
     try:
-        return get_display(arabic_reshaper.reshape(text))
-    except Exception:
-        return text
+        return os.path.commonpath(
+            [normalize(child), normalize(parent)]
+        ) == normalize(parent)
+    except ValueError:
+        return False
 
 
 def human_size(size):
@@ -66,72 +55,97 @@ def human_size(size):
         value /= 1024
 
 
-def normalize(path):
-    return os.path.normcase(os.path.abspath(path))
+def safe_folder_name(path, index):
+    """Create a Windows-safe folder name for a source inside the backup."""
+    stripped = path.rstrip("\\/")
+    drive, tail = os.path.splitdrive(stripped)
 
-
-def is_inside(child, parent):
-    """True when child is equal to or located inside parent."""
-    try:
-        return os.path.commonpath(
-            [normalize(child), normalize(parent)]
-        ) == normalize(parent)
-    except ValueError:
-        return False
-
-
-def safe_source_name(path, index):
-    """Create a safe unique output name for a selected source."""
-    if os.path.isfile(path):
-        name = os.path.basename(path)
+    if drive and not tail:
+        name = f"{drive[0].upper()}_Drive"
     else:
-        stripped = path.rstrip("\\/")
-        drive, tail = os.path.splitdrive(stripped)
-
-        if drive and not tail:
-            name = f"{drive[0].upper()}_Drive"
-        else:
-            name = os.path.basename(stripped) or "Source"
+        name = os.path.basename(stripped) or "Source"
 
     name = re.sub(r'[<>:"/\\|?*]', "_", name).strip(" .")
     return f"{index:02d}_{name or 'Source'}"
 
 
-def is_reparse_point(path):
-    """Best-effort Windows reparse-point detection."""
-    try:
-        info = os.stat(path, follow_symlinks=False)
-        attrs = getattr(info, "st_file_attributes", 0)
-        flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-        return bool(attrs & flag)
-    except OSError:
-        return False
+# ============================================================================
+# Source and destination selection
+# ============================================================================
+
+def create_hidden_root():
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    return root
 
 
-# ============================================================================
-# Source management
-# ============================================================================
+def choose_sources(root):
+    """
+    Collect backup sources from the user.
+
+    Step 1:
+        Open a file picker that allows selecting multiple files at once.
+
+    Step 2:
+        Open a folder picker. After each selected folder, ask whether the
+        user wants to add another folder.
+    """
+    sources = []
+
+    # Allow selecting multiple individual files in one dialog.
+    files = filedialog.askopenfilenames(
+        parent=root,
+        title="اختر الملفات المراد نسخها - يمكنك تحديد أكثر من ملف"
+    )
+
+    for path in files:
+        add_source(sources, path)
+
+    # Allow adding one or more folders.
+    while True:
+        folder = filedialog.askdirectory(
+            parent=root,
+            title="اختر مجلد للنسخ - اضغط إلغاء إذا انتهيت"
+        )
+
+        if not folder:
+            break
+
+        add_source(sources, folder)
+
+        again = messagebox.askyesno(
+            "إضافة مصدر",
+            "هل تريد إضافة مجلد آخر؟",
+            parent=root
+        )
+
+        if not again:
+            break
+
+    return sources
+
 
 def add_source(sources, path):
     """
-    Add a source without redundant duplicates.
+    Add a source only when it is not already covered by another source.
 
-    If a selected folder already contains this path, the new path is redundant.
-    If the new folder contains previously selected items, those child items are
-    removed because the parent folder now covers them.
+    Exact duplicates are ignored. If a file or folder is already located
+    inside a selected source folder, it is not added again.
     """
     path = os.path.abspath(path)
 
     if not os.path.exists(path):
-        return False
+        return
 
     for existing in sources:
         if normalize(existing) == normalize(path):
-            return False
+            return
 
         if os.path.isdir(existing) and is_inside(path, existing):
-            return False
+            return
 
+    # If a parent folder is added, remove existing sources already covered by it.
     if os.path.isdir(path):
         sources[:] = [
             existing
@@ -140,189 +154,13 @@ def add_source(sources, path):
         ]
 
     sources.append(path)
-    return True
 
-
-class SourcePicker:
-    """One small window for managing all files/folders before backup."""
-
-    def __init__(self, root):
-        self.root = root
-        self.sources = []
-        self.result = None
-
-        self.win = tk.Toplevel(root)
-        self.win.title(APP_NAME)
-        self.win.geometry("760x430")
-        self.win.minsize(650, 360)
-        self.win.protocol("WM_DELETE_WINDOW", self.cancel)
-        self.win.transient(root)
-        self.win.grab_set()
-
-        self._build()
-
-    def _build(self):
-        main = ttk.Frame(self.win, padding=16)
-        main.pack(fill="both", expand=True)
-
-        ttk.Label(
-            main,
-            text=APP_NAME,
-            font=("Segoe UI", 16, "bold")
-        ).pack(anchor="w")
-
-        ttk.Label(
-            main,
-            text=ar("اختر كل الملفات والمجلدات التي تريد نسخها، ثم اضغط متابعة"),
-            font=("Segoe UI", 10)
-        ).pack(anchor="w", pady=(4, 12))
-
-        buttons = ttk.Frame(main)
-        buttons.pack(fill="x")
-
-        ttk.Button(
-            buttons,
-            text=ar("إضافة ملفات"),
-            command=self.add_files
-        ).pack(side="left")
-
-        ttk.Button(
-            buttons,
-            text=ar("إضافة مجلد"),
-            command=self.add_folder
-        ).pack(side="left", padx=6)
-
-        ttk.Button(
-            buttons,
-            text=ar("حذف المحدد"),
-            command=self.remove_selected
-        ).pack(side="left", padx=6)
-
-        ttk.Button(
-            buttons,
-            text=ar("مسح القائمة"),
-            command=self.clear_all
-        ).pack(side="left")
-
-        list_frame = ttk.Frame(main)
-        list_frame.pack(fill="both", expand=True, pady=12)
-
-        self.listbox = tk.Listbox(
-            list_frame,
-            selectmode=tk.EXTENDED,
-            font=("Consolas", 10),
-            activestyle="none"
-        )
-        scroll = ttk.Scrollbar(
-            list_frame,
-            orient="vertical",
-            command=self.listbox.yview
-        )
-        self.listbox.configure(yscrollcommand=scroll.set)
-
-        self.listbox.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-
-        bottom = ttk.Frame(main)
-        bottom.pack(fill="x")
-
-        self.count_label = ttk.Label(
-            bottom,
-            text=ar("لا توجد مصادر بعد")
-        )
-        self.count_label.pack(side="left")
-
-        ttk.Button(
-            bottom,
-            text=ar("إلغاء"),
-            command=self.cancel
-        ).pack(side="right")
-
-        ttk.Button(
-            bottom,
-            text=ar("متابعة"),
-            command=self.finish
-        ).pack(side="right", padx=(0, 8))
-
-    def add_files(self):
-        paths = filedialog.askopenfilenames(
-            parent=self.win,
-            title="Select files to back up"
-        )
-
-        changed = False
-        for path in paths:
-            changed = add_source(self.sources, path) or changed
-
-        if changed:
-            self.refresh()
-
-    def add_folder(self):
-        path = filedialog.askdirectory(
-            parent=self.win,
-            title="Select a folder to back up"
-        )
-
-        if path and add_source(self.sources, path):
-            self.refresh()
-
-    def remove_selected(self):
-        indexes = list(self.listbox.curselection())
-        for index in reversed(indexes):
-            del self.sources[index]
-        self.refresh()
-
-    def clear_all(self):
-        self.sources.clear()
-        self.refresh()
-
-    def refresh(self):
-        self.listbox.delete(0, "end")
-
-        for index, path in enumerate(self.sources, 1):
-            kind = "FILE" if os.path.isfile(path) else "DIR "
-            self.listbox.insert(
-                "end",
-                f"{index:02d}  [{kind}]  {path}"
-            )
-
-        if self.sources:
-            self.count_label.config(
-                text=ar("عدد المصادر المحددة") + f": {len(self.sources)}"
-            )
-        else:
-            self.count_label.config(text=ar("لا توجد مصادر بعد"))
-
-    def finish(self):
-        if not self.sources:
-            messagebox.showwarning(
-                ar("تنبيه"),
-                ar("أضف ملفاً أو مجلداً واحداً على الأقل."),
-                parent=self.win
-            )
-            return
-
-        self.result = list(self.sources)
-        self.win.destroy()
-
-    def cancel(self):
-        self.result = None
-        self.win.destroy()
-
-    def show(self):
-        self.root.wait_window(self.win)
-        return self.result
-
-
-# ============================================================================
-# Destination
-# ============================================================================
 
 def choose_destination(root, sources):
     while True:
         destination = filedialog.askdirectory(
             parent=root,
-            title="Select backup destination"
+            title="اختر مكان حفظ النسخة الاحتياطية"
         )
 
         if not destination:
@@ -330,19 +168,24 @@ def choose_destination(root, sources):
 
         destination = os.path.abspath(destination)
 
-        if any(
-            os.path.isdir(source) and is_inside(destination, source)
-            for source in sources
-        ):
+        invalid = False
+
+        for source in sources:
+            if os.path.isdir(source) and is_inside(destination, source):
+                invalid = True
+                break
+
+        if invalid:
             messagebox.showerror(
-                ar("مكان غير صالح"),
-                ar("مكان الحفظ لا يمكن أن يكون داخل أحد مجلدات المصدر."),
+                "مكان غير صالح",
+                "مكان الحفظ لا يمكن أن يكون داخل أحد مجلدات المصدر.",
                 parent=root
             )
             continue
 
         try:
             os.makedirs(destination, exist_ok=True)
+
             test_path = os.path.join(
                 destination,
                 f".yazn_write_test_{os.getpid()}.tmp"
@@ -356,21 +199,20 @@ def choose_destination(root, sources):
 
         except OSError as exc:
             messagebox.showerror(
-                ar("خطأ"),
-                ar("تعذر الكتابة إلى مكان الحفظ.") + f"\n\n{exc}",
+                "خطأ",
+                f"تعذر الكتابة إلى مكان الحفظ:\n{exc}",
                 parent=root
             )
 
 
 # ============================================================================
-# File walking / hashing
+# Source scanning
 # ============================================================================
 
-def iter_source_files(source, stop_event=None, error_callback=None):
-    """Yield real files while avoiding symlink/reparse loops."""
+def iter_source_files(source, error_callback=None):
+    """Yield one selected file, or recursively yield every file inside a folder."""
     if os.path.isfile(source):
-        if not os.path.islink(source) and not is_reparse_point(source):
-            yield source
+        yield source
         return
 
     def on_walk_error(exc):
@@ -383,37 +225,67 @@ def iter_source_files(source, stop_event=None, error_callback=None):
         onerror=on_walk_error,
         followlinks=False
     ):
-        if stop_event and stop_event.is_set():
-            return
-
-        dirs[:] = [
-            dirname
-            for dirname in dirs
-            if not os.path.islink(os.path.join(current_root, dirname))
-            and not is_reparse_point(os.path.join(current_root, dirname))
-        ]
-
         for filename in files:
-            if stop_event and stop_event.is_set():
-                return
+            yield os.path.join(current_root, filename)
 
-            path = os.path.join(current_root, filename)
 
-            if os.path.islink(path) or is_reparse_point(path):
+def scan_sources(sources):
+    """
+    Scan all selected sources before copying.
+
+    The scan calculates the total file count, total size, scan errors,
+    and how many files share each file size. Size counts are later used
+    to avoid calculating SHA-256 hashes unless duplicate content is possible.
+    """
+    total_files = 0
+    total_bytes = 0
+    scan_errors = 0
+    size_counts = Counter()
+
+    def on_error(_):
+        nonlocal scan_errors
+        scan_errors += 1
+
+    for source in sources:
+        for filepath in iter_source_files(
+            source,
+            error_callback=on_error
+        ):
+            try:
+                size = os.path.getsize(filepath)
+            except OSError:
+                scan_errors += 1
                 continue
 
-            yield path
+            total_files += 1
+            total_bytes += size
+            size_counts[size] += 1
+
+    return {
+        "total_files": total_files,
+        "total_bytes": total_bytes,
+        "scan_errors": scan_errors,
+        "size_counts": size_counts,
+    }
 
 
-def sha256_file(filepath, stop_event=None):
+# ============================================================================
+# Duplicate detection
+# ============================================================================
+
+def sha256_file(filepath):
+    """
+    Calculate the SHA-256 hash of a file in chunks.
+
+    Reading in chunks prevents large files from being loaded entirely
+    into memory.
+    """
     digest = hashlib.sha256()
 
     with open(filepath, "rb") as handle:
         while True:
-            if stop_event and stop_event.is_set():
-                return None
-
             chunk = handle.read(HASH_CHUNK_SIZE)
+
             if not chunk:
                 break
 
@@ -423,12 +295,16 @@ def sha256_file(filepath, stop_event=None):
 
 
 # ============================================================================
-# Logger
+# Backup logging
 # ============================================================================
 
 class BackupLogger:
     def __init__(self, filepath):
-        self.handle = open(filepath, "a", encoding="utf-8")
+        self.handle = open(
+            filepath,
+            "a",
+            encoding="utf-8"
+        )
 
     def write(self, text):
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -443,218 +319,81 @@ class BackupLogger:
 
 
 # ============================================================================
-# Background worker
+# Backup copy engine
 # ============================================================================
 
-class BackupWorker(threading.Thread):
-    def __init__(self, sources, destination, events, stop_event):
-        super().__init__(daemon=True)
-        self.sources = list(sources)
-        self.destination = destination
-        self.events = events
-        self.stop_event = stop_event
+def copy_sources(sources, destination, scan_info):
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    def emit(self, event, **data):
-        self.events.put((event, data))
+    backup_root = os.path.join(
+        destination,
+        f"Backup_{timestamp}"
+    )
 
-    def run(self):
-        try:
-            self._run()
-        except Exception as exc:
-            self.emit("fatal", message=str(exc))
-
-    def _run(self):
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        backup_root = os.path.join(
-            self.destination,
-            f"Backup_{timestamp}"
-        )
-
-        os.makedirs(backup_root, exist_ok=False)
-
-        logger = BackupLogger(
-            os.path.join(backup_root, "backup_log.txt")
-        )
-
-        logger.write(f"{APP_NAME} v{VERSION}")
-        logger.write("Backup started")
-        logger.write("Sources: " + " | ".join(self.sources))
-        logger.write(f"Destination: {backup_root}")
-
-        try:
-            # ------------------------------------------------------------
-            # Scan
-            # ------------------------------------------------------------
-            self.emit("phase", name="scan")
-
-            total_files = 0
-            total_bytes = 0
-            scan_errors = 0
-            size_counts = Counter()
-
-            def scan_error(message):
-                nonlocal scan_errors
-                scan_errors += 1
-                logger.write("SCAN ERROR: " + message)
-
-            for source in self.sources:
-                for filepath in iter_source_files(
-                    source,
-                    stop_event=self.stop_event,
-                    error_callback=scan_error
-                ):
-                    if self.stop_event.is_set():
-                        self.emit("stopped", backup_root=backup_root)
-                        return
-
-                    self.emit("current", path=filepath)
-
-                    try:
-                        size = os.path.getsize(filepath)
-                    except OSError as exc:
-                        scan_errors += 1
-                        logger.write(f"SCAN STAT ERROR: {filepath} | {exc}")
-                        continue
-
-                    total_files += 1
-                    total_bytes += size
-                    size_counts[size] += 1
-
-                    if total_files % 100 == 0:
-                        self.emit(
-                            "scan_progress",
-                            files=total_files,
-                            bytes=total_bytes,
-                            errors=scan_errors
-                        )
-
-            self.emit(
-                "scan_done",
-                total_files=total_files,
-                total_bytes=total_bytes,
-                scan_errors=scan_errors
-            )
-
-            if self.stop_event.is_set():
-                self.emit("stopped", backup_root=backup_root)
-                return
-
-            free_space = shutil.disk_usage(self.destination).free
-
-            # This is a conservative pre-dedup estimate. Ask the UI instead
-            # of hard-failing, because duplicates can lower final size.
-            if free_space < total_bytes:
-                self.emit(
-                    "space_warning",
-                    required=total_bytes,
-                    free=free_space,
-                    backup_root=backup_root
-                )
-                return
-
-            self._copy(
-                backup_root,
-                logger,
-                size_counts,
-                total_files,
-                total_bytes,
-                scan_errors
-            )
-
-        finally:
-            # _copy closes through its result path; close is idempotent.
-            logger.close()
-
-    def _copy(
-        self,
+    os.makedirs(
         backup_root,
-        logger,
-        size_counts,
-        total_files,
-        total_bytes,
-        scan_errors
-    ):
-        self.emit("phase", name="copy")
+        exist_ok=False
+    )
 
-        copied = 0
-        duplicates = 0
-        failed = 0
-        processed_files = 0
-        processed_bytes = 0
+    logger = BackupLogger(
+        os.path.join(
+            backup_root,
+            "backup_log.txt"
+        )
+    )
 
-        # size -> {sha256: successfully_copied_source_path}
-        seen_hashes = defaultdict(dict)
+    copied = 0
+    duplicates = 0
+    failed = 0
 
-        for source_index, source in enumerate(self.sources, 1):
-            if self.stop_event.is_set():
-                break
+    size_counts = scan_info["size_counts"]
 
+    # Map each file size to {sha256_hash: first_seen_source_path}.
+    seen_hashes = defaultdict(dict)
+
+    logger.write(f"{APP_NAME} v{VERSION}")
+    logger.write("Backup started")
+    logger.write(
+        "Sources: " + " | ".join(sources)
+    )
+    logger.write(f"Destination: {backup_root}")
+
+    try:
+        for source_index, source in enumerate(sources, 1):
+
+            # ------------------------------------------------------------
+            # Source type: individual file
+            # ------------------------------------------------------------
             if os.path.isfile(source):
-                source_output = backup_root
-            else:
-                source_output = os.path.join(
-                    backup_root,
-                    safe_source_name(source, source_index)
-                )
-                os.makedirs(source_output, exist_ok=True)
-
-            for filepath in iter_source_files(
-                source,
-                stop_event=self.stop_event,
-                error_callback=lambda msg: logger.write("WALK ERROR: " + msg)
-            ):
-                if self.stop_event.is_set():
-                    break
-
-                self.emit("current", path=filepath)
-                size = 0
-                digest = None
+                filepath = source
 
                 try:
                     size = os.path.getsize(filepath)
 
                     if size_counts.get(size, 0) > 1:
-                        digest = sha256_file(
-                            filepath,
-                            stop_event=self.stop_event
-                        )
+                        file_hash = sha256_file(filepath)
 
-                        if digest is None:
-                            break
-
-                        if digest in seen_hashes[size]:
+                        if file_hash in seen_hashes[size]:
                             duplicates += 1
                             logger.write(
                                 f"DUPLICATE SKIPPED: {filepath} | "
-                                f"same_as={seen_hashes[size][digest]}"
+                                f"same_as={seen_hashes[size][file_hash]}"
                             )
                             continue
 
-                    if os.path.isfile(source):
-                        destination_path = os.path.join(
-                            backup_root,
-                            safe_source_name(source, source_index)
-                        )
-                    else:
-                        relative_path = os.path.relpath(filepath, source)
-                        destination_path = os.path.join(
-                            source_output,
-                            relative_path
-                        )
+                        seen_hashes[size][file_hash] = filepath
 
-                    os.makedirs(
-                        os.path.dirname(destination_path),
-                        exist_ok=True
+                    destination_path = os.path.join(
+                        backup_root,
+                        f"{source_index:02d}_{os.path.basename(filepath)}"
                     )
 
-                    shutil.copy2(filepath, destination_path)
-                    copied += 1
+                    shutil.copy2(
+                        filepath,
+                        destination_path
+                    )
 
-                    # IMPORTANT: record a duplicate fingerprint only after a
-                    # successful copy. If copy fails, a later identical file
-                    # must still get a chance to be copied.
-                    if digest is not None:
-                        seen_hashes[size][digest] = filepath
+                    copied += 1
 
                     logger.write(
                         f"COPIED: {filepath} -> {destination_path}"
@@ -662,378 +401,176 @@ class BackupWorker(threading.Thread):
 
                 except (PermissionError, OSError, shutil.Error) as exc:
                     failed += 1
-                    logger.write(f"FAILED: {filepath} | {exc}")
-
-                finally:
-                    processed_files += 1
-                    processed_bytes += size
-
-                    self.emit(
-                        "progress",
-                        copied=copied,
-                        duplicates=duplicates,
-                        failed=failed,
-                        processed_files=processed_files,
-                        total_files=total_files,
-                        processed_bytes=processed_bytes,
-                        total_bytes=total_bytes,
-                        scan_errors=scan_errors
+                    logger.write(
+                        f"FAILED: {filepath} | {exc}"
                     )
 
-        if self.stop_event.is_set():
-            logger.write("Backup stopped by user")
-            self.emit(
-                "stopped",
-                backup_root=backup_root,
-                copied=copied,
-                duplicates=duplicates,
-                failed=failed
+                continue
+
+            # ------------------------------------------------------------
+            # Source type: directory
+            # ------------------------------------------------------------
+            source_output = os.path.join(
+                backup_root,
+                safe_folder_name(source, source_index)
             )
-            return
 
-        logger.write(
-            f"Summary copied={copied} duplicates={duplicates} "
-            f"failed={failed} scan_errors={scan_errors}"
-        )
+            os.makedirs(
+                source_output,
+                exist_ok=True
+            )
 
-        self.emit(
-            "finished",
-            backup_root=backup_root,
-            copied=copied,
-            duplicates=duplicates,
-            failed=failed,
-            scan_errors=scan_errors
-        )
-
-
-# ============================================================================
-# Progress window
-# ============================================================================
-
-class ProgressWindow:
-    def __init__(self, root, sources, destination):
-        self.root = root
-        self.sources = sources
-        self.destination = destination
-        self.events = queue.Queue()
-        self.stop_event = threading.Event()
-        self.worker = None
-        self.finished_data = None
-
-        self.win = tk.Toplevel(root)
-        self.win.title(APP_NAME)
-        self.win.geometry("720x300")
-        self.win.resizable(False, False)
-        self.win.protocol("WM_DELETE_WINDOW", self.request_stop)
-        self.win.transient(root)
-
-        self._build()
-
-    def _build(self):
-        main = ttk.Frame(self.win, padding=18)
-        main.pack(fill="both", expand=True)
-
-        ttk.Label(
-            main,
-            text=APP_NAME,
-            font=("Segoe UI", 15, "bold")
-        ).pack(anchor="w")
-
-        self.phase_label = ttk.Label(
-            main,
-            text=ar("جاري التحضير..."),
-            font=("Segoe UI", 10, "bold")
-        )
-        self.phase_label.pack(anchor="w", pady=(12, 5))
-
-        self.progress = ttk.Progressbar(
-            main,
-            mode="indeterminate",
-            maximum=100
-        )
-        self.progress.pack(fill="x")
-        self.progress.start(12)
-
-        self.amount_label = ttk.Label(main, text="0 B / 0 B")
-        self.amount_label.pack(anchor="w", pady=(6, 3))
-
-        ttk.Label(
-            main,
-            text=ar("الملف الحالي"),
-            font=("Segoe UI", 9, "bold")
-        ).pack(anchor="w", pady=(7, 2))
-
-        self.current_label = ttk.Label(
-            main,
-            text="-",
-            wraplength=675,
-            font=("Consolas", 9)
-        )
-        self.current_label.pack(anchor="w", fill="x")
-
-        stats = ttk.Frame(main)
-        stats.pack(fill="x", pady=(13, 0))
-
-        self.ok_label = ttk.Label(stats, text="OK: 0")
-        self.ok_label.pack(side="left")
-
-        self.dup_label = ttk.Label(stats, text="DUP: 0")
-        self.dup_label.pack(side="left", padx=20)
-
-        self.err_label = ttk.Label(stats, text="ERR: 0")
-        self.err_label.pack(side="left")
-
-        self.stop_button = ttk.Button(
-            stats,
-            text=ar("إيقاف"),
-            command=self.request_stop
-        )
-        self.stop_button.pack(side="right")
-
-    def start(self):
-        self.worker = BackupWorker(
-            self.sources,
-            self.destination,
-            self.events,
-            self.stop_event
-        )
-        self.worker.start()
-        self.win.after(100, self.poll)
-        self.root.wait_window(self.win)
-        return self.finished_data
-
-    def request_stop(self):
-        if self.stop_event.is_set():
-            return
-
-        self.stop_event.set()
-        self.stop_button.config(state="disabled")
-        self.phase_label.config(text=ar("جاري الإيقاف..."))
-
-    def poll(self):
-        try:
-            while True:
-                event, data = self.events.get_nowait()
-                self.handle_event(event, data)
-        except queue.Empty:
-            pass
-
-        try:
-            if self.win.winfo_exists():
-                self.win.after(100, self.poll)
-        except tk.TclError:
-            pass
-
-    def handle_event(self, event, data):
-        if event == "phase":
-            if data["name"] == "scan":
-                self.phase_label.config(text=ar("جاري فحص الملفات..."))
-                self.progress.config(mode="indeterminate")
-                self.progress.start(12)
-            else:
-                self.phase_label.config(text=ar("جاري نسخ الملفات..."))
-                self.progress.stop()
-                self.progress.config(mode="determinate", value=0)
-
-        elif event == "current":
-            self.current_label.config(text=data["path"])
-
-        elif event == "scan_progress":
-            self.amount_label.config(
-                text=(
-                    f"{data['files']:,} files  |  "
-                    f"{human_size(data['bytes'])}"
+            for filepath in iter_source_files(
+                source,
+                error_callback=lambda error: logger.write(
+                    f"WALK ERROR: {error}"
                 )
-            )
+            ):
+                try:
+                    size = os.path.getsize(filepath)
 
-        elif event == "scan_done":
-            self.progress.stop()
-            self.progress.config(mode="determinate", value=0)
-            self.amount_label.config(
-                text=f"0 B / {human_size(data['total_bytes'])}"
-            )
+                    if size_counts.get(size, 0) > 1:
+                        file_hash = sha256_file(filepath)
 
-        elif event == "progress":
-            total = data["total_bytes"]
-            done = data["processed_bytes"]
-            percent = min(100.0, done / total * 100) if total else 100.0
+                        if file_hash in seen_hashes[size]:
+                            duplicates += 1
+                            logger.write(
+                                f"DUPLICATE SKIPPED: {filepath} | "
+                                f"same_as={seen_hashes[size][file_hash]}"
+                            )
+                            continue
 
-            self.progress["value"] = percent
-            self.amount_label.config(
-                text=f"{human_size(done)} / {human_size(total)}"
-            )
-            self.ok_label.config(text=f"OK: {data['copied']:,}")
-            self.dup_label.config(text=f"DUP: {data['duplicates']:,}")
-            self.err_label.config(text=f"ERR: {data['failed']:,}")
+                        seen_hashes[size][file_hash] = filepath
 
-        elif event == "space_warning":
-            # We do not continue the same worker because the logger/file state
-            # belongs to that thread. Abort conservatively with a clear result.
-            required = human_size(data["required"])
-            free = human_size(data["free"])
-            self.finished_data = {
-                "status": "no_space",
-                "backup_root": data["backup_root"],
-                "required": required,
-                "free": free,
-            }
-            self.win.destroy()
+                    relative_path = os.path.relpath(
+                        filepath,
+                        source
+                    )
 
-        elif event == "finished":
-            self.finished_data = {"status": "finished", **data}
-            self.win.destroy()
+                    destination_path = os.path.join(
+                        source_output,
+                        relative_path
+                    )
 
-        elif event == "stopped":
-            self.finished_data = {"status": "stopped", **data}
-            self.win.destroy()
+                    os.makedirs(
+                        os.path.dirname(destination_path),
+                        exist_ok=True
+                    )
 
-        elif event == "fatal":
-            self.finished_data = {
-                "status": "fatal",
-                "message": data["message"]
-            }
-            self.win.destroy()
+                    shutil.copy2(
+                        filepath,
+                        destination_path
+                    )
 
+                    copied += 1
 
-# ============================================================================
-# Result window - custom UI avoids RTL/messagebox direction issues
-# ============================================================================
+                    logger.write(
+                        f"COPIED: {filepath} -> {destination_path}"
+                    )
 
-def show_result(root, result):
-    win = tk.Toplevel(root)
-    win.title(APP_NAME)
-    win.geometry("560x360")
-    win.resizable(False, False)
-    win.transient(root)
-    win.grab_set()
+                except (PermissionError, OSError, shutil.Error) as exc:
+                    failed += 1
+                    logger.write(
+                        f"FAILED: {filepath} | {exc}"
+                    )
 
-    main = ttk.Frame(win, padding=22)
-    main.pack(fill="both", expand=True)
+    finally:
+        logger.write(
+            f"Summary copied={copied} "
+            f"duplicates={duplicates} "
+            f"failed={failed}"
+        )
+        logger.close()
 
-    status = result.get("status")
-
-    if status == "finished":
-        heading = "اكتملت عملية النسخ"
-        subtitle = "تم الانتهاء من النسخ الاحتياطي بنجاح"
-    elif status == "stopped":
-        heading = "تم إيقاف النسخ"
-        subtitle = "توقفت العملية قبل اكتمال جميع الملفات"
-    elif status == "no_space":
-        heading = "المساحة غير كافية"
-        subtitle = "المساحة المتاحة أقل من الحجم المتوقع للنسخة"
-    else:
-        heading = "حدث خطأ"
-        subtitle = "تعذر إكمال عملية النسخ"
-
-    ttk.Label(
-        main,
-        text=ar(heading),
-        font=("Segoe UI", 16, "bold")
-    ).pack(anchor="center")
-
-    ttk.Label(
-        main,
-        text=ar(subtitle),
-        font=("Segoe UI", 10)
-    ).pack(anchor="center", pady=(6, 18))
-
-    if status in {"finished", "stopped"}:
-        rows = [
-            ("تم النسخ", result.get("copied", 0)),
-            ("المكرر", result.get("duplicates", 0)),
-            ("الفاشل", result.get("failed", 0)),
-            ("أخطاء الفحص", result.get("scan_errors", 0)),
-        ]
-
-        for label, value in rows:
-            row = ttk.Frame(main)
-            row.pack(fill="x", pady=2)
-
-            ttk.Label(
-                row,
-                text=ar(label),
-                width=18,
-                anchor="e"
-            ).pack(side="right")
-
-            ttk.Label(
-                row,
-                text=f"{value:,}",
-                width=15,
-                anchor="w",
-                font=("Consolas", 10, "bold")
-            ).pack(side="right", padx=(10, 0))
-
-        backup_root = result.get("backup_root", "")
-
-        if backup_root:
-            ttk.Separator(main).pack(fill="x", pady=14)
-            ttk.Label(
-                main,
-                text=ar("مكان النسخة"),
-                font=("Segoe UI", 9, "bold")
-            ).pack(anchor="e")
-
-            path_box = ttk.Entry(main)
-            path_box.pack(fill="x", pady=(5, 0))
-            path_box.insert(0, backup_root)
-            path_box.config(state="readonly")
-
-    elif status == "no_space":
-        ttk.Label(
-            main,
-            text=f"Required: {result.get('required', '-')}\nFree: {result.get('free', '-')}",
-            font=("Consolas", 11)
-        ).pack(pady=12)
-
-    else:
-        ttk.Label(
-            main,
-            text=result.get("message", "Unknown error"),
-            wraplength=500,
-            font=("Consolas", 9)
-        ).pack(pady=12)
-
-    ttk.Button(
-        main,
-        text=ar("إغلاق"),
-        command=win.destroy
-    ).pack(side="bottom", pady=(18, 0))
-
-    root.wait_window(win)
+    return backup_root, copied, duplicates, failed
 
 
 # ============================================================================
-# Main
+# Completion result
+# ============================================================================
+
+def show_result(
+    root,
+    backup_root,
+    copied,
+    duplicates,
+    failed
+):
+    messagebox.showinfo(
+        "Backup",
+        (
+            "تم الانتهاء من النسخ الاحتياطي.\n\n"
+            f"تم نسخ: {copied:,} ملف\n"
+            f"تم تجاهل المكرر: {duplicates:,}\n"
+            f"الأخطاء/الفشل: {failed:,}\n\n"
+            f"مكان النسخة:\n{backup_root}"
+        ),
+        parent=root
+    )
+
+
+# ============================================================================
+# Application entry point
 # ============================================================================
 
 def main():
-    root = tk.Tk()
-    root.withdraw()
+    root = create_hidden_root()
 
     try:
-        picker = SourcePicker(root)
-        sources = picker.show()
+        # 1) Select one or more source files/folders.
+        sources = choose_sources(root)
 
         if not sources:
             return 0
 
-        destination = choose_destination(root, sources)
+        # 2) Select the backup destination.
+        destination = choose_destination(
+            root,
+            sources
+        )
+
         if not destination:
             return 0
 
-        progress = ProgressWindow(root, sources, destination)
-        result = progress.start()
+        # 3) Scan all selected sources before copying.
+        scan_info = scan_sources(sources)
 
-        if result:
-            show_result(root, result)
+        # 4) Verify that the destination has enough free space.
+        free_space = shutil.disk_usage(destination).free
+
+        if free_space < scan_info["total_bytes"]:
+            messagebox.showerror(
+                "المساحة غير كافية",
+                (
+                    f"الحجم المتوقع: {human_size(scan_info['total_bytes'])}\n"
+                    f"المتاح: {human_size(free_space)}"
+                ),
+                parent=root
+            )
+            return 1
+
+        # 5) Copy all selected sources.
+        backup_root, copied, duplicates, failed = copy_sources(
+            sources,
+            destination,
+            scan_info
+        )
+
+        # 6) Show the final backup summary.
+        show_result(
+            root,
+            backup_root,
+            copied,
+            duplicates,
+            failed
+        )
 
         return 0
 
     except Exception as exc:
         messagebox.showerror(
-            ar("خطأ"),
-            ar("حدث خطأ غير متوقع.") + f"\n\n{exc}",
+            "خطأ",
+            f"حدث خطأ غير متوقع:\n{exc}",
             parent=root
         )
         return 1
